@@ -1,3 +1,8 @@
+> [!NOTE]
+> **This is henricook's fork**: upstream Ghostty as of my last rebase, plus
+> session save/restore for Linux (Wayland/GNOME/Ubuntu) - tabs, split
+> layouts, tab names, working directories. See [FORK.md](FORK.md).
+
 <!-- LOGO -->
 <h1>
 <p align="center">
