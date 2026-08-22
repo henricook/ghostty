@@ -125,6 +125,119 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// Errors that can result from validating a caller-provided set
+        /// of nodes, e.g. one that was deserialized from disk.
+        pub const ValidateError = Allocator.Error || error{
+            /// The nodes slice was empty. Empty trees are represented by
+            /// the `empty` constant, not by an empty node slice.
+            Empty,
+
+            /// A split references a handle that is out of bounds or
+            /// references the root node.
+            InvalidHandle,
+
+            /// A node is referenced by more than one split.
+            DuplicateReference,
+
+            /// A node isn't reachable from the root. This also covers
+            /// cycles that are disjoint from the root.
+            UnreachableNode,
+
+            /// A split ratio isn't a finite number.
+            InvalidRatio,
+
+            /// The zoomed handle is out of bounds.
+            InvalidZoom,
+        };
+
+        /// Initialize a tree from a caller-provided set of nodes, such as
+        /// one restored from a serialized form. The nodes are validated
+        /// (see `validate`) before anything is allocated or referenced, so
+        /// a failure leaves the caller's views untouched.
+        ///
+        /// The nodes are copied into a new arena and a reference is taken
+        /// on every leaf view, so the caller retains ownership of both the
+        /// slice and its views.
+        ///
+        /// Split ratios are clamped to `[0, 1]`, matching the range that
+        /// `resize` produces.
+        pub fn initFromSlice(
+            gpa: Allocator,
+            nodes: []const Node,
+            zoomed: ?Node.Handle,
+        ) ValidateError!Self {
+            try validate(gpa, nodes, zoomed);
+
+            var arena = ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            const copy = try alloc.dupe(Node, nodes);
+            for (copy) |*node| switch (node.*) {
+                .leaf => {},
+                .split => |*s| s.ratio = @min(@max(s.ratio, 0), 1),
+            };
+
+            // Must be last so that no unref is required on failure.
+            try refNodes(gpa, copy);
+
+            return .{
+                .arena = arena,
+                .nodes = copy,
+                .zoomed = zoomed,
+            };
+        }
+
+        /// Validate that the given nodes form a well-formed tree rooted at
+        /// index 0: every node is reachable from the root exactly once,
+        /// all handles are in bounds, and all ratios are finite. Ratios
+        /// outside `[0, 1]` are accepted here because `initFromSlice`
+        /// clamps them.
+        ///
+        /// The allocator is only used for temporary traversal state.
+        pub fn validate(
+            gpa: Allocator,
+            nodes: []const Node,
+            zoomed: ?Node.Handle,
+        ) ValidateError!void {
+            if (nodes.len == 0) return error.Empty;
+            if (zoomed) |v| if (v.idx() >= nodes.len) return error.InvalidZoom;
+
+            const visited = try gpa.alloc(bool, nodes.len);
+            defer gpa.free(visited);
+            @memset(visited, false);
+
+            // Every node is pushed at most once because we mark it visited
+            // as we push it, so the node count is enough capacity.
+            const stack = try gpa.alloc(Node.Handle, nodes.len);
+            defer gpa.free(stack);
+
+            visited[0] = true;
+            stack[0] = .root;
+            var len: usize = 1;
+            while (len > 0) {
+                len -= 1;
+                const s = switch (nodes[stack[len].idx()]) {
+                    .leaf => continue,
+                    .split => |s| s,
+                };
+
+                if (!std.math.isFinite(s.ratio)) return error.InvalidRatio;
+
+                for ([_]Node.Handle{ s.left, s.right }) |child| {
+                    if (child == .root or child.idx() >= nodes.len) {
+                        return error.InvalidHandle;
+                    }
+                    if (visited[child.idx()]) return error.DuplicateReference;
+                    visited[child.idx()] = true;
+                    stack[len] = child;
+                    len += 1;
+                }
+            }
+
+            for (visited) |v| if (!v) return error.UnreachableNode;
+        }
+
         pub fn deinit(self: *Self) void {
             // Important: only free memory if we have memory to free,
             // because we use an undefined arena for empty trees.
@@ -760,9 +873,9 @@ pub fn SplitTree(comptime V: type) type {
                     .split => {},
                     .leaf => |view| nodes[i] = .{ .leaf = try viewRef(view, gpa) },
                 }
-                reffed = i;
+                reffed = i + 1;
             }
-            assert(reffed == nodes.len - 1);
+            assert(reffed == nodes.len);
         }
 
         /// Equalize this node and all its children, returning a new node with splits
@@ -1377,13 +1490,19 @@ const TestView = struct {
 
     label: []const u8,
 
+    /// Number of references handed out by `ref` and not yet released.
+    /// Tests compare deltas rather than absolute values.
+    var live: usize = 0;
+
     pub fn ref(self: *Self, alloc: Allocator) Allocator.Error!*Self {
         const ptr = try alloc.create(Self);
         ptr.* = self.*;
+        live += 1;
         return ptr;
     }
 
     pub fn unref(self: *Self, alloc: Allocator) void {
+        live -= 1;
         alloc.destroy(self);
     }
 
@@ -2526,4 +2645,356 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+fn expectSameTree(expected: *const TestTree, actual: *const TestTree) !void {
+    const testing = std.testing;
+    try testing.expectEqual(expected.zoomed, actual.zoomed);
+    try testing.expectEqual(expected.nodes.len, actual.nodes.len);
+    for (expected.nodes, actual.nodes) |e, a| {
+        try testing.expectEqual(std.meta.activeTag(e), std.meta.activeTag(a));
+        switch (e) {
+            .leaf => |view| try testing.expectEqualStrings(view.label, a.leaf.label),
+            .split => |s| try testing.expectEqual(s, a.split),
+        }
+    }
+}
+
+test "SplitTree: initFromSlice round trip" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    // A | B horizontal, then B split down with C.
+    var ab = try t1.split(alloc, .root, .right, 0.25, &t2);
+    defer ab.deinit();
+    const handle_b = at: {
+        var it = ab.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var abc = try ab.split(alloc, handle_b, .down, 0.75, &t3);
+    defer abc.deinit();
+    abc.zoom(at: {
+        var it = abc.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "C")) break entry.handle;
+        } else return error.NotFound;
+    });
+
+    const live = TestView.live;
+    {
+        var restored = try TestTree.initFromSlice(alloc, abc.nodes, abc.zoomed);
+        defer restored.deinit();
+
+        // One new reference per leaf.
+        try testing.expectEqual(live + 3, TestView.live);
+        try expectSameTree(&abc, &restored);
+
+        const expected = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(abc, .formatText)});
+        defer alloc.free(expected);
+        const actual = try std.fmt.allocPrint(alloc, "{f}", .{std.fmt.alt(restored, .formatText)});
+        defer alloc.free(actual);
+        try testing.expectEqualStrings(expected, actual);
+    }
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice single leaf" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    const nodes = [_]TestTree.Node{.{ .leaf = &v1 }};
+
+    const live = TestView.live;
+    {
+        var t = try TestTree.initFromSlice(alloc, &nodes, null);
+        defer t.deinit();
+        try testing.expectEqual(live + 1, TestView.live);
+        try testing.expect(!t.isSplit());
+        try testing.expectEqualStrings("A", t.nodes[0].leaf.label);
+
+        // The caller's view is untouched, we hold our own reference.
+        try testing.expect(t.nodes[0].leaf != &v1);
+    }
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice clamps ratios" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    var v3: TestTree.View = .{ .label = "C" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 2.0,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .split = .{
+            .layout = .vertical,
+            .ratio = -1.0,
+            .left = @enumFromInt(3),
+            .right = @enumFromInt(4),
+        } },
+        .{ .leaf = &v2 },
+        .{ .leaf = &v3 },
+    };
+
+    var t = try TestTree.initFromSlice(alloc, &nodes, null);
+    defer t.deinit();
+    try testing.expectEqual(@as(f16, 1.0), t.nodes[0].split.ratio);
+    try testing.expectEqual(@as(f16, 0.0), t.nodes[2].split.ratio);
+}
+
+test "SplitTree: initFromSlice empty" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.Empty,
+        TestTree.initFromSlice(alloc, &[_]TestTree.Node{}, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice handle out of bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(7),
+        } },
+        .{ .leaf = &v1 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.InvalidHandle,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice split references root" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = .root,
+            .right = @enumFromInt(1),
+        } },
+        .{ .leaf = &v1 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.InvalidHandle,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice node referenced twice" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .split = .{
+            .layout = .vertical,
+            .ratio = 0.5,
+            .left = @enumFromInt(2),
+            .right = @enumFromInt(3),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.DuplicateReference,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice orphan node" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    var v3: TestTree.View = .{ .label = "C" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+        .{ .leaf = &v3 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.UnreachableNode,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice disjoint cycle" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Every non-root node is referenced exactly once, but nodes 3-6 form
+    // a cycle that isn't reachable from the root.
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    var v3: TestTree.View = .{ .label = "C" };
+    var v4: TestTree.View = .{ .label = "D" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(4),
+            .right = @enumFromInt(5),
+        } },
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(3),
+            .right = @enumFromInt(6),
+        } },
+        .{ .leaf = &v3 },
+        .{ .leaf = &v4 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.UnreachableNode,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice non-finite ratio" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = std.math.nan(f16),
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.InvalidRatio,
+        TestTree.initFromSlice(alloc, &nodes, null),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice zoomed out of bounds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+    };
+
+    const live = TestView.live;
+    try testing.expectError(
+        error.InvalidZoom,
+        TestTree.initFromSlice(alloc, &nodes, @enumFromInt(3)),
+    );
+    try testing.expectEqual(live, TestView.live);
+}
+
+test "SplitTree: initFromSlice allocation failures" {
+    var v1: TestTree.View = .{ .label = "A" };
+    var v2: TestTree.View = .{ .label = "B" };
+    const nodes = [_]TestTree.Node{
+        .{ .split = .{
+            .layout = .horizontal,
+            .ratio = 0.5,
+            .left = @enumFromInt(1),
+            .right = @enumFromInt(2),
+        } },
+        .{ .leaf = &v1 },
+        .{ .leaf = &v2 },
+    };
+
+    const live = TestView.live;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        struct {
+            fn f(alloc: Allocator, n: []const TestTree.Node) !void {
+                var t = try TestTree.initFromSlice(alloc, n, null);
+                t.deinit();
+            }
+        }.f,
+        .{@as([]const TestTree.Node, &nodes)},
+    );
+    try std.testing.expectEqual(live, TestView.live);
 }
