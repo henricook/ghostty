@@ -56,4 +56,8 @@ test {
     _ = runtime;
     _ = action;
     _ = structs;
+
+    // The GTK session schema has no GTK dependencies, so it can be tested
+    // in any build regardless of the selected app runtime.
+    _ = @import("apprt/gtk/session.zig");
 }

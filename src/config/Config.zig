@@ -2272,7 +2272,8 @@ keybind: Keybinds = .{},
 ///
 ///   * `default` will use the default system behavior. On macOS, this
 ///     will only save state if the application is forcibly terminated
-///     or if it is configured systemwide via Settings.app.
+///     or if it is configured systemwide via Settings.app. On Linux, there
+///     is no system-level behavior, so this behaves like `always`.
 ///
 ///   * `never` will never save window state.
 ///
@@ -2292,8 +2293,47 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// This is currently only supported on macOS. This has no effect on Linux.
+/// ## Platform differences
+///
+/// On macOS, this uses the native AppKit window restoration system and can
+/// restore window position, size, tabs, and splits.
+///
+/// On Linux (GTK), Ghostty saves the open windows, their tabs, each tab's
+/// split layout, each split's working directory, and any titles you set
+/// yourself to `$XDG_STATE_HOME/ghostty/<app id>/session.json` (typically
+/// `~/.local/state/ghostty/com.mitchellh.ghostty/session.json`) on exit, and
+/// restores them on the next launch. Window size and maximized state are also
+/// restored, but not window position, since Wayland does not allow it. Titles
+/// set by the terminal itself are not saved: restoring one would pin it
+/// permanently, and a fresh shell sets it again anyway. Accurate working
+/// directories require shell integration (see `shell-integration`); splits
+/// whose working directory is unknown are restored using the default working
+/// directory. Restored splits always start a fresh shell: running processes
+/// are not restored, and windows running an explicit command (such as the
+/// configuration editor, or `ghostty -e`) are not saved at all.
+///
+/// Only the canonical instance takes part: session state is neither saved nor
+/// restored when `gtk-single-instance` resolves to `false` (which any launch
+/// with CLI arguments does, including `ghostty -e`) or when `initial-window`
+/// is `false`, since several such processes can run at once and would
+/// overwrite each other's state. Each application id (see `class`) keeps its
+/// own session, so a debug build never disturbs a release one.
 @"window-save-state": WindowSaveState = .default,
+
+/// The maximum number of bytes of scrollback to persist per split when
+/// `window-save-state` saves a session (Linux/GTK only).
+///
+/// When greater than zero, each restored split's scrollback (history plus the
+/// visible screen) is saved to disk and replayed into it on the next launch,
+/// so previous output (including colors) appears above the new shell prompt.
+/// Only the most recent bytes up to this budget are kept.
+///
+/// Scrollback is written to `<state>/ghostty/<app id>/scrollback` alongside
+/// the session file, one file per split. The default value of `0` disables
+/// scrollback persistence and discards any files a previous run left there;
+/// window, tab, and working-directory restoration are unaffected. This has no
+/// effect on macOS.
+@"window-save-state-scrollback-size": usize = 0,
 
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently

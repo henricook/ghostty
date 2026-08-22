@@ -6,10 +6,12 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
+const global = @import("../../../global.zig");
 const apprt = @import("../../../apprt.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const ext = @import("../ext.zig");
 const gresource = @import("../build/gresource.zig");
+const session = @import("../session.zig");
 const Common = @import("../class.zig").Common;
 const Config = @import("config.zig").Config;
 const Application = @import("application.zig").Application;
@@ -156,6 +158,10 @@ pub const Tab = extern struct {
     };
 
     const Private = struct {
+        /// Stable random identifier for this tab, assigned at creation and
+        /// overridable on session restore. Keys the tab's scrollback file.
+        id: u64 = 0,
+
         /// The configuration that this surface is using.
         config: ?*Config = null,
 
@@ -192,12 +198,31 @@ pub const Tab = extern struct {
         shell_integration: ?configpkg.Config.ShellIntegration = null,
         working_directory: ?[:0]const u8 = null,
         title: ?[:0]const u8 = null,
+        /// Tab-level title override, distinct from `title` which pins the
+        /// title override of the tab's initial surface.
+        tab_title: ?[:0]const u8 = null,
+        restore_scrollback: ?[]const u8 = null,
+        /// Stable id to assign (from session restore). If null, a fresh random
+        /// id is generated.
+        id: ?u64 = null,
+        /// A pre-built split tree to install (from session restore) instead of
+        /// creating a single initial surface. The tree is cloned, so the
+        /// caller keeps ownership of it and of its surfaces. When this is set
+        /// the surface-level overrides above are ignored: they were already
+        /// applied to the surfaces in the tree.
+        tree: ?*const Surface.Tree = null,
+        /// The surface within `tree` that should be focused.
+        focus: ?*Surface = null,
 
         pub const none: @This() = .{};
     }) *Self {
         const tab = gobject.ext.newInstance(Tab, .{});
 
         const priv: *Private = tab.private();
+
+        // `init` already assigned a fresh random id; override it with the
+        // restored id when one is provided.
+        if (overrides.id) |id| priv.id = id;
 
         if (config) |c| priv.config = c.ref();
 
@@ -210,26 +235,39 @@ pub const Tab = extern struct {
 
         tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
-        // Create our initial surface in the split tree.
-        priv.split_tree.newSplit(.right, null, .{
-            .command = overrides.command,
-            .shell_integration = overrides.shell_integration,
-            .working_directory = overrides.working_directory,
-            .title = overrides.title,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => {
-                // TODO: We should make our "no surfaces" state more aesthetically
-                // pleasing and show something like an "Oops, something went wrong"
-                // message. For now, this is incredibly unlikely.
-                @panic("oom");
-            },
-        };
+        if (overrides.tab_title) |title| tab.setTitleOverride(title);
+
+        if (overrides.tree) |tree| {
+            // Session restore: the surfaces already exist, so install the
+            // whole tree rather than creating an initial surface.
+            priv.split_tree.setRestoredTree(tree, overrides.focus);
+        } else {
+            // Create our initial surface in the split tree.
+            priv.split_tree.newSplit(.right, null, .{
+                .command = overrides.command,
+                .shell_integration = overrides.shell_integration,
+                .working_directory = overrides.working_directory,
+                .title = overrides.title,
+                .restore_scrollback = overrides.restore_scrollback,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => {
+                    // TODO: We should make our "no surfaces" state more aesthetically
+                    // pleasing and show something like an "Oops, something went wrong"
+                    // message. For now, this is incredibly unlikely.
+                    @panic("oom");
+                },
+            };
+        }
 
         return tab;
     }
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
+
+        // Assign a stable random id to every tab at creation. `new()` may
+        // override it (with a restored id) for session restore.
+        self.private().id = session.newId(global.io());
 
         // Init our actions
         self.initActionMap();
@@ -253,6 +291,14 @@ pub const Tab = extern struct {
     //---------------------------------------------------------------
     // Properties
 
+    /// Returns the user-set tab title override (from "prompt-tab-title"), if
+    /// any. This is the raw override, NOT the computed display title (which
+    /// includes a default string and bell/zoom decorations), so it is suitable
+    /// for persisting a meaningful title to restore.
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
+    }
+
     /// Overridden title. This will be generally be shown over the title
     /// unless this is unset (null).
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
@@ -261,6 +307,9 @@ pub const Tab = extern struct {
         priv.title_override = null;
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
+
+        // Title overrides are persisted, so the session changed.
+        Application.default().scheduleSaveSession();
     }
     fn titleDialogSet(
         _: *TitleDialog,
@@ -282,6 +331,11 @@ pub const Tab = extern struct {
         );
 
         dialog.present(self.as(gtk.Widget));
+    }
+
+    /// The stable id of this tab. See `Private.id`.
+    pub fn getId(self: *Self) u64 {
+        return self.private().id;
     }
 
     /// Get the currently active surface. See the "active-surface" property.

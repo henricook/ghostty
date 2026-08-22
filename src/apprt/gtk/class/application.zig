@@ -30,6 +30,7 @@ const CoreSurface = @import("../../../Surface.zig");
 
 const ext = @import("../ext.zig");
 const key = @import("../key.zig");
+const session = @import("../session.zig");
 const adw_version = @import("../adw_version.zig");
 const gtk_version = @import("../gtk_version.zig");
 const winprotopkg = @import("../winproto.zig");
@@ -48,6 +49,10 @@ const OpenURI = @import("../portal.zig").OpenURI;
 const media = @import("../media.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
+
+/// How long to wait after a state change before writing the session file.
+/// See `Application.scheduleSaveSession`.
+const session_save_delay_ms = 1000;
 
 extern "c" fn setenv(name: ?[*]const u8, value: ?[*]const u8, overwrite: c_int) c_int;
 
@@ -189,6 +194,10 @@ pub const Application = extern struct {
         /// window.
         requested_window: bool = false,
 
+        /// Set once the primary instance has handled its first activation,
+        /// which is the single point where a saved session is restored.
+        did_first_activate: bool = false,
+
         /// This is set to false internally when the event loop
         /// should exit and the application should quit. This must
         /// only be set by the main loop thread.
@@ -210,6 +219,18 @@ pub const Application = extern struct {
 
         /// glib source for our signal handler.
         signal_source: ?c_uint = null,
+
+        /// glib timeout source for a pending session save. Event hooks (tab
+        /// added/removed, split layout changed, working directory changed,
+        /// title override changed) schedule a save through this so state is
+        /// persisted promptly even if Ghostty is killed without a clean
+        /// shutdown (battery dies, OOM, SIGKILL). Multiple changes before the
+        /// timeout fires are coalesced into a single write.
+        session_save_source: ?c_uint = null,
+
+        /// Hash of the most recently written session state. Used to skip
+        /// redundant writes when nothing has changed since the last save.
+        last_session_hash: ?u64 = null,
 
         /// CSS Provider for any styles based on Ghostty configuration values.
         css_provider: *gtk.CssProvider,
@@ -540,7 +561,14 @@ pub const Application = extern struct {
             // We need to scope any config access because once we run our
             // event loop, this can change out from underneath us.
             const config = priv.config.get();
-            if (config.@"initial-window") self.as(gio.Application).activate();
+
+            // Session restore happens on the first `activate` (see
+            // `activate`), which this triggers for a normal launch. A
+            // D-Bus-activated launch skips this (`--initial-window=false`)
+            // and restores when the desktop shell's Activate call arrives.
+            if (config.@"initial-window") {
+                self.as(gio.Application).activate();
+            }
         }
 
         // If we are NOT the primary instance, then we never want to run.
@@ -651,6 +679,12 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // Save the session before we destroy any windows, while surfaces
+        // and their working directories are still valid. This is the single
+        // convergence point for all quit routes (no-windows auto-quit, the
+        // quit action, and the close-confirmation dialog).
+        self.saveSession(true, null);
+
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -676,6 +710,638 @@ pub const Application = extern struct {
 
         // Trigger our runloop exit.
         self.private().running = false;
+    }
+
+    /// Returns our application id if this process owns the on-disk session
+    /// state, null otherwise. Both saving and restoring go through this so
+    /// they can never disagree.
+    ///
+    /// Only the canonical single instance participates. With
+    /// `gtk-single-instance = false` (which `ghostty -e` and any CLI launch
+    /// force) several primary instances run at once, and they would otherwise
+    /// overwrite each other's session file and delete each other's scrollback.
+    /// `initial-window = false` (e.g. a D-Bus-activated launch) still owns
+    /// state: it restores on its first activation, and an instance that never
+    /// opens a window never writes (empty sessions are not saved).
+    fn sessionStateOwner(self: *Self) ?[:0]const u8 {
+        if (self.as(gio.Application).getIsRemote() != 0) return null;
+
+        const config = self.private().config.get();
+        switch (config.@"gtk-single-instance") {
+            .true => {},
+            .false => return null,
+            // Resolved during config load; if it somehow isn't, don't claim
+            // ownership of state we might be sharing.
+            .detect => return null,
+        }
+
+        const id = self.as(gio.Application).getApplicationId() orelse return null;
+        return std.mem.span(id);
+    }
+
+    /// Persist the current set of windows, their tabs, each tab's split
+    /// layout, each surface's working directory and any user-set title
+    /// overrides to disk so they can be restored on the next launch. This is a best-effort operation: all
+    /// errors are logged and swallowed so a save failure never blocks quit.
+    ///
+    /// This is public because it is also called from a window's close-request
+    /// handler: when the last window is closed by the user, the window is
+    /// destroyed before the run loop notices there are no windows left and
+    /// calls `quitNow`, so saving from `quitNow` alone would see zero windows.
+    ///
+    /// `exclude` is a window that should be left out of the saved state (the
+    /// window currently being closed, which is still a live toplevel).
+    pub fn saveSession(self: *Self, write_scrollback: bool, exclude: ?*Window) void {
+        const priv = self.private();
+        const config = priv.config.get();
+
+        const app_id = self.sessionStateOwner() orelse return;
+
+        var environ_map = global.environMap() catch |err| {
+            log.warn("failed to read environment for session save err={}", .{err});
+            return;
+        };
+        defer environ_map.deinit();
+        const io = global.io();
+
+        // If saving is disabled, discard any state we already wrote when
+        // explicitly set to `never` so that it isn't restored later, then
+        // bail. This is logged at debug because event hooks call us
+        // frequently.
+        if (!session.shouldSaveState(config)) {
+            log.debug(
+                "session save skipped, window-save-state={s}",
+                .{@tagName(config.@"window-save-state")},
+            );
+            if (config.@"window-save-state" == .never) {
+                session.delete(io, self.allocator(), &environ_map, app_id);
+                session.pruneScrollback(io, self.allocator(), &environ_map, app_id, &.{});
+                // Force a fresh write if saving is later re-enabled, since the
+                // file no longer exists even if the state hash is unchanged.
+                priv.last_session_hash = null;
+            }
+            return;
+        }
+
+        log.debug("building session state", .{});
+
+        // Per-surface scrollback budget. 0 disables scrollback persistence.
+        const scrollback_size = config.@"window-save-state-scrollback-size";
+
+        // Build the session on an arena so cleanup is trivial.
+        var arena = std.heap.ArenaAllocator.init(self.allocator());
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // Surfaces whose scrollback we should dump after deciding to save.
+        // Each entry pairs the GTK surface with its stable id. Only realized
+        // surfaces (whose shell has started) are included; unrealized ones
+        // keep their existing on-disk scrollback untouched.
+        const ScrollbackTarget = struct { id: u64, surface: *Surface };
+        var scrollback_targets: std.ArrayListUnmanaged(ScrollbackTarget) = .empty;
+        // Every surface id in the session, used to prune orphaned scrollback
+        // files. Restored surfaces keep their saved id even if they were
+        // never realized, so their scrollback survives the prune.
+        var all_surface_ids: std.ArrayListUnmanaged(u64) = .empty;
+
+        var windows: std.ArrayListUnmanaged(session.Session.Window) = .empty;
+
+        const glist = gtk.Window.listToplevels();
+        defer glist.free();
+        var current_: ?*glib.List = glist;
+        while (current_) |node| : (current_ = node.f_next) {
+            const data = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(data));
+
+            // We only persist our own windows, and never the quick terminal.
+            const window = gobject.ext.cast(Window, gtk_window) orelse continue;
+            if (window.isQuickTerminal()) continue;
+            if (window == exclude) continue;
+
+            const tab_view = window.getTabView();
+            const n = tab_view.getNPages();
+            if (n <= 0) continue;
+
+            var tabs: std.ArrayListUnmanaged(session.Session.Tab) = .empty;
+            for (0..@intCast(n)) |i| {
+                const page = tab_view.getNthPage(@intCast(i));
+                const child = page.getChild();
+                const tab = gobject.ext.cast(Tab, child) orelse continue;
+
+                const tab_tree = tab.getSurfaceTree();
+
+                // A surface created with an explicit command (the config
+                // editor window, a `new_tab` action carrying a command) can't
+                // be restored: we only ever restore fresh shells. Skip a tab
+                // made up entirely of those rather than bringing it back as an
+                // unrelated shell wearing the command's pinned title.
+                if (tab_tree) |tree| skip: {
+                    if (tree.isEmpty()) break :skip;
+                    for (tree.nodes) |tree_node| switch (tree_node) {
+                        .split => {},
+                        .leaf => |surface| if (!surface.hasCommandOverride()) break :skip,
+                    };
+                    continue;
+                }
+
+                // Mirror the tab's split tree node-for-node so that indices
+                // (and therefore the zoomed handle) survive the round trip.
+                const tree_: ?session.Session.Tree = tree: {
+                    const tree = tab_tree orelse break :tree null;
+                    if (tree.isEmpty()) break :tree null;
+
+                    // Prefer the tree's last-focused surface over
+                    // getActiveSurface: surfaces initialize with a stale
+                    // focused=true flag, so the first-focused-match scan can
+                    // report a pane that never actually held focus.
+                    const active = active: {
+                        if (tab.getSplitTree().getLastFocusedSurface()) |v| {
+                            if (tree.locate(v) != null) break :active v;
+                        }
+                        break :active tab.getActiveSurface();
+                    };
+                    const nodes = alloc.alloc(
+                        session.Session.Node,
+                        tree.nodes.len,
+                    ) catch return;
+
+                    for (tree.nodes, nodes) |src, *dst| switch (src) {
+                        .split => |s| dst.* = .{ .split = .{
+                            .layout = switch (s.layout) {
+                                .horizontal => .horizontal,
+                                .vertical => .vertical,
+                            },
+                            .ratio = @floatCast(s.ratio),
+                            .left = @intFromEnum(s.left),
+                            .right = @intFromEnum(s.right),
+                        } },
+
+                        .leaf => |surface| {
+                            const id = surface.getId();
+                            all_surface_ids.append(alloc, id) catch {};
+
+                            // Collect realized surfaces as scrollback dump
+                            // targets. Unrealized ones (shell not started,
+                            // e.g. a restored surface never shown) are skipped
+                            // so their saved scrollback file is preserved
+                            // rather than overwritten with empty content.
+                            if (scrollback_size > 0 and surface.core() != null) {
+                                scrollback_targets.append(alloc, .{
+                                    .id = id,
+                                    .surface = surface,
+                                }) catch {};
+                            }
+
+                            // Working directory: prefer the live pwd (from
+                            // shell integration). Fall back to the
+                            // restore-time override so that restored surfaces
+                            // which were never shown (so their shell never
+                            // started and pwd is still null) keep their
+                            // directory across save cycles instead of
+                            // collapsing to the default.
+                            const wd_src = surface.getPwd() orelse
+                                surface.getOverrideWorkingDirectory();
+
+                            dst.* = .{
+                                .leaf = .{
+                                    .id = id,
+                                    .pwd = if (wd_src) |v|
+                                        (alloc.dupe(u8, v) catch null)
+                                    else
+                                        null,
+                                    // A command surface's title describes a process
+                                    // we won't restore, so it would be a permanent
+                                    // lie over the shell that takes its place.
+                                    .title_override = if (surface.hasCommandOverride())
+                                        null
+                                    else if (surface.getTitleOverride()) |v|
+                                        (alloc.dupe(u8, v) catch null)
+                                    else
+                                        null,
+                                    .focused = active == surface,
+                                },
+                            };
+                        },
+                    };
+
+                    break :tree .{
+                        .nodes = nodes,
+                        .zoomed = if (tree.zoomed) |z| @intFromEnum(z) else null,
+                    };
+                };
+
+                // Only user-set title overrides are persisted. Terminal-set
+                // titles are excluded on purpose: restoring one would pin it
+                // as an override, freezing a title the shell would otherwise
+                // keep up to date.
+                tabs.append(alloc, .{
+                    .id = tab.getId(),
+                    .title = if (tab.getTitleOverride()) |t|
+                        (alloc.dupe(u8, t) catch null)
+                    else
+                        null,
+                    .tree = tree_,
+                }) catch return;
+            }
+
+            if (tabs.items.len == 0) continue;
+
+            // Record the current window geometry (0 if not yet allocated).
+            const width = window.as(gtk.Widget).getWidth();
+            const height = window.as(gtk.Widget).getHeight();
+
+            // Record which tab is currently selected so it can be re-focused.
+            const focused_tab: ?u32 = ft: {
+                const sel = tab_view.getSelectedPage() orelse break :ft null;
+                const pos = tab_view.getPagePosition(sel);
+                break :ft if (pos >= 0) @intCast(pos) else null;
+            };
+            log.debug("saving window tabs={d} focused_tab={?d}", .{ tabs.items.len, focused_tab });
+
+            windows.append(alloc, .{
+                .id = window.getId(),
+                .width = if (width > 0) width else null,
+                .height = if (height > 0) height else null,
+                .maximized = window.as(gtk.Window).isMaximized() != 0,
+                .title = if (window.getTitleOverride()) |t|
+                    (alloc.dupe(u8, t) catch null)
+                else
+                    null,
+                .focused_tab = focused_tab,
+                .tabs = tabs.items,
+            }) catch return;
+        }
+
+        // Nothing worth saving. Leave any existing file untouched so that a
+        // previously-saved good state survives (e.g. while quitNow runs after
+        // the last window was already destroyed via its close handler).
+        if (windows.items.len == 0) {
+            log.debug("no windows to save, leaving any existing session file", .{});
+            return;
+        }
+
+        var total_tabs: usize = 0;
+        for (windows.items) |w| total_tabs += w.tabs.len;
+
+        // Serialize once so we can both hash it for change detection and write
+        // it. The bytes live on the arena and are freed with it.
+        const bytes = session.serialize(alloc, .{
+            .windows = windows.items,
+        }) catch |err| {
+            log.warn("failed to serialize session err={}", .{err});
+            return;
+        };
+
+        // Skip the JSON write if nothing changed since our last successful
+        // save. This keeps the frequent event-driven saves cheap. Scrollback
+        // (below) is handled independently since it changes without the JSON.
+        const hash = std.hash.Wyhash.hash(0, bytes);
+        const changed = if (priv.last_session_hash) |prev| prev != hash else true;
+        if (changed) {
+            session.writeBytes(io, self.allocator(), &environ_map, app_id, bytes) catch |err| {
+                log.warn("failed to write session err={}", .{err});
+                return;
+            };
+            priv.last_session_hash = hash;
+            log.info(
+                "saved session windows={} tabs={}",
+                .{ windows.items.len, total_tabs },
+            );
+        } else {
+            log.debug("session unchanged, skipping json write", .{});
+        }
+
+        // Dump scrollback for each realized surface when requested (on quit /
+        // window close). Done independently of the JSON change check because
+        // scrollback grows without changing the session structure, and on a
+        // temporary allocation per surface so large dumps aren't retained.
+        // Unrealized surfaces were not collected, so their `<id>.vt` is
+        // untouched.
+        if (write_scrollback) {
+            const gpa = self.allocator();
+            for (scrollback_targets.items) |target| {
+                const dump_ = target.surface.dumpScrollbackVt(gpa, scrollback_size) catch |err| {
+                    log.warn("failed to dump scrollback id={d} err={}", .{ target.id, err });
+                    continue;
+                };
+                if (dump_) |dump| {
+                    defer gpa.free(dump);
+                    session.writeScrollback(
+                        io,
+                        gpa,
+                        &environ_map,
+                        app_id,
+                        target.id,
+                        dump,
+                    ) catch |err| {
+                        log.warn("failed to write scrollback id={d} err={}", .{ target.id, err });
+                    };
+                } else {
+                    // Realized surface with empty scrollback: clear any
+                    // stale file.
+                    session.deleteScrollback(io, gpa, &environ_map, app_id, target.id);
+                }
+            }
+
+            // Remove scrollback files for surfaces that no longer exist. With
+            // persistence disabled nothing was collected, so this discards
+            // every dump a previous run left behind.
+            session.pruneScrollback(
+                io,
+                gpa,
+                &environ_map,
+                app_id,
+                if (scrollback_size > 0) all_surface_ids.items else &.{},
+            );
+        }
+    }
+
+    /// Attempt to restore a previously saved session. Returns true if at least
+    /// one window was restored, in which case the caller should not open the
+    /// default empty window.
+    fn tryRestoreSession(self: *Self) bool {
+        const priv = self.private();
+        const config = priv.config.get();
+        if (!session.shouldRestoreState(config)) {
+            log.info(
+                "session restore skipped, window-save-state={s}",
+                .{@tagName(config.@"window-save-state")},
+            );
+            return false;
+        }
+
+        const app_id = self.sessionStateOwner() orelse return false;
+
+        // An explicit startup command wants a window of its own. Restoring
+        // would suppress that window and hand the command to whichever
+        // restored surface initialized first.
+        if (config.@"initial-command" != null) {
+            log.info("session restore skipped, an initial command was given", .{});
+            return false;
+        }
+
+        var environ_map = global.environMap() catch |err| {
+            log.warn("failed to read environment for session restore err={}", .{err});
+            return false;
+        };
+        defer environ_map.deinit();
+        const io = global.io();
+
+        const gpa = self.allocator();
+        const parsed = (session.load(io, gpa, &environ_map, app_id) catch |err| {
+            log.warn("failed to load session err={}", .{err});
+            return false;
+        }) orelse {
+            log.info("no saved session to restore", .{});
+            return false;
+        };
+        defer parsed.deinit();
+
+        const sess = parsed.value;
+        if (sess.windows.len == 0) return false;
+
+        log.info("restoring session windows={}", .{sess.windows.len});
+
+        // Scrollback is only restored if persistence is currently enabled.
+        const scrollback_size = config.@"window-save-state-scrollback-size";
+
+        // Arena for the temporary override strings/bytes. The window/tab/surface
+        // creation paths dupe these synchronously, so the arena can be freed
+        // once we're done creating windows.
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        var restored: usize = 0;
+        for (sess.windows) |win_data| {
+            if (win_data.tabs.len == 0) continue;
+            if (restored >= session.max_restore_windows) {
+                log.warn(
+                    "session has more than {d} windows, ignoring the rest",
+                    .{session.max_restore_windows},
+                );
+                break;
+            }
+
+            const geometry: Action.WindowGeometry = .{
+                .width = if (win_data.width) |w| @intCast(w) else null,
+                .height = if (win_data.height) |h| @intCast(h) else null,
+                .maximized = win_data.maximized,
+            };
+
+            // The first tab opens the window; the rest are appended to it.
+            var win_: ?*Window = null;
+            for (win_data.tabs, 0..) |tab_data, tab_i| {
+                if (tab_i >= session.max_restore_tabs) {
+                    log.warn(
+                        "window has more than {d} tabs, ignoring the rest",
+                        .{session.max_restore_tabs},
+                    );
+                    break;
+                }
+
+                // Rebuild the tab's split layout. A tab with no saved tree
+                // (or a malformed one) falls back to a single default
+                // surface so the rest of the session still restores.
+                var built_: ?RestoredTree = if (tab_data.tree) |saved|
+                    (self.buildRestoredTree(
+                        alloc,
+                        io,
+                        &environ_map,
+                        app_id,
+                        scrollback_size,
+                        saved,
+                    ) catch |err| fallback: {
+                        log.warn(
+                            "unable to restore split layout, using a single surface err={}",
+                            .{err},
+                        );
+                        break :fallback null;
+                    })
+                else
+                    null;
+                defer if (built_) |*b| b.deinit();
+
+                const tree: ?*const Surface.Tree = if (built_) |*b| &b.tree else null;
+                const focus: ?*Surface = if (built_) |b| b.focus else null;
+
+                if (win_) |win| {
+                    win.newTabForWindow(null, .{
+                        .tab_title = dupeOptZ(alloc, tab_data.title),
+                        .id = idOrNull(tab_data.id),
+                        .tree = tree,
+                        .focus = focus,
+                    });
+                } else {
+                    win_ = Action.newWindowReturning(self, null, .{
+                        .tab_title = dupeOptZ(alloc, tab_data.title),
+                        .id = idOrNull(tab_data.id),
+                        .tree = tree,
+                        .focus = focus,
+                    }, geometry, idOrNull(win_data.id)) catch |err| {
+                        log.warn("failed to restore window err={}", .{err});
+                        break;
+                    };
+                }
+            }
+
+            const win = win_ orelse continue;
+
+            // Only titles the user explicitly set are saved, so this is
+            // always restored as an override.
+            if (win_data.title) |t| win.setTitleOverride(t);
+
+            // Re-select the tab that was focused when the session was saved.
+            // newTabForWindow selects each new tab as it's added, so by default
+            // the last tab would be focused; this restores the real selection.
+            // We select the page directly by its 0-indexed position. (Window
+            // .selectTab's `.n` is 1-indexed and no-ops on 0, so it's not used
+            // here.)
+            if (win_data.focused_tab) |ft| {
+                const tab_view = win.getTabView();
+                const n = tab_view.getNPages();
+                if (n > 0 and ft < @as(u32, @intCast(n))) {
+                    tab_view.setSelectedPage(tab_view.getNthPage(@intCast(ft)));
+                    log.debug("restored focused tab index={d}", .{ft});
+                } else {
+                    log.warn(
+                        "saved focused_tab={d} out of range (npages={d})",
+                        .{ ft, n },
+                    );
+                }
+            }
+
+            restored += 1;
+        }
+
+        log.info("restored session windows={}", .{restored});
+        return restored > 0;
+    }
+
+    /// A split tree rebuilt from saved session state, together with the
+    /// surfaces it references. The value owns the tree plus one reference to
+    /// every surface in it, all released by `deinit`.
+    const RestoredTree = struct {
+        tree: Surface.Tree,
+        surfaces: []const *Surface,
+        focus: ?*Surface,
+
+        fn deinit(self: *RestoredTree) void {
+            self.tree.deinit();
+            for (self.surfaces) |surface| surface.unref();
+        }
+    };
+
+    /// Rebuild a tab's split tree from saved state, creating one unrealized
+    /// surface per leaf. Node indices are preserved exactly, so the saved
+    /// zoom handle applies unchanged. Invalid layouts are rejected by
+    /// `initFromSlice` before anything is referenced.
+    ///
+    /// `alloc` is expected to be an arena holding the node array, the surface
+    /// list and the override strings: everything the creation path copies out
+    /// of synchronously.
+    fn buildRestoredTree(
+        self: *Self,
+        alloc: Allocator,
+        io: std.Io,
+        environ_map: *const std.process.Environ.Map,
+        app_id: []const u8,
+        scrollback_size: usize,
+        saved: session.Session.Tree,
+    ) !RestoredTree {
+        // Bound the work before we construct anything: `initFromSlice` only
+        // rejects a bad layout after every surface in it has been created.
+        if (saved.nodes.len > session.max_restore_nodes) return error.TooManyNodes;
+
+        const nodes = try alloc.alloc(Surface.Tree.Node, saved.nodes.len);
+        var surfaces: std.ArrayListUnmanaged(*Surface) = .empty;
+        try surfaces.ensureTotalCapacity(alloc, saved.nodes.len);
+
+        // Until the tree is built we own every surface we created, so
+        // release them all if we bail out.
+        errdefer for (surfaces.items) |surface| surface.unref();
+
+        var focus: ?*Surface = null;
+        for (saved.nodes, nodes) |src, *dst| switch (src) {
+            .split => |s| dst.* = .{ .split = .{
+                .layout = switch (s.layout) {
+                    .horizontal => .horizontal,
+                    .vertical => .vertical,
+                },
+                .ratio = @floatCast(s.ratio),
+                .left = @enumFromInt(s.left),
+                .right = @enumFromInt(s.right),
+            } },
+
+            .leaf => |leaf| {
+                // No parent is set: a parent would overwrite the working
+                // directory override with the parent surface's pwd.
+                const surface: *Surface = .new(.{
+                    .working_directory = dupeOptZ(alloc, leaf.pwd),
+                    .title = dupeOptZ(alloc, leaf.title_override),
+                    .restore_scrollback = readScrollback(
+                        alloc,
+                        io,
+                        environ_map,
+                        app_id,
+                        scrollback_size,
+                        leaf.id,
+                    ),
+                    .id = idOrNull(leaf.id),
+                });
+
+                // `new` returns a floating reference; sinking it makes us the
+                // owner until the tree takes its own reference below.
+                _ = surface.refSink();
+                surfaces.appendAssumeCapacity(surface);
+
+                // Saved state may mark no leaves focused, or several. Neither
+                // is fatal: the first one wins and none is also fine.
+                if (leaf.focused and focus == null) focus = surface;
+
+                dst.* = .{ .leaf = surface };
+            },
+        };
+
+        return .{
+            .tree = try Surface.Tree.initFromSlice(
+                self.allocator(),
+                nodes,
+                if (saved.zoomed) |z| @enumFromInt(z) else null,
+            ),
+            .surfaces = surfaces.items,
+            .focus = focus,
+        };
+    }
+
+    /// Read a surface's saved scrollback bytes for injection, keyed by its
+    /// stable id. Returns null when scrollback persistence is disabled, the
+    /// id is unset, or nothing is saved for it.
+    fn readScrollback(
+        alloc: Allocator,
+        io: std.Io,
+        environ_map: *const std.process.Environ.Map,
+        app_id: []const u8,
+        size: usize,
+        id: u64,
+    ) ?[]const u8 {
+        if (size == 0 or id == 0) return null;
+        return session.readScrollback(io, alloc, environ_map, app_id, size, id) catch |err| {
+            log.warn("failed to read scrollback id={d} err={}", .{ id, err });
+            return null;
+        };
+    }
+
+    /// A saved id of 0 means "unset"; null asks for a fresh random id.
+    fn idOrNull(v: u64) ?u64 {
+        return if (v == 0) null else v;
+    }
+
+    /// Duplicate an optional slice into an optional sentinel-terminated slice.
+    /// Returns null on allocation failure (best-effort).
+    fn dupeOptZ(alloc: Allocator, s: ?[]const u8) ?[:0]const u8 {
+        const v = s orelse return null;
+        return alloc.dupeZ(u8, v) catch null;
     }
 
     /// apprt API to perform an action.
@@ -1472,6 +2138,41 @@ pub const Application = extern struct {
         );
     }
 
+    /// Schedule a session save to run shortly after the current burst of
+    /// changes settles.
+    ///
+    /// This is called from event hooks (tab added/removed, split layout
+    /// changed, working directory changed, title override changed) so we
+    /// persist state promptly without polling. Saving is deferred rather than
+    /// done synchronously because some of those events fire during widget
+    /// teardown, when enumerating windows would be unsafe.
+    ///
+    /// The delay coalesces bursts into a single write: dragging a split
+    /// divider changes the tree ratio on every motion event, which an idle
+    /// callback would turn into one write per frame. All quit paths save
+    /// synchronously, so a pending save is never the only copy of anything.
+    pub fn scheduleSaveSession(self: *Self) void {
+        const priv = self.private();
+        if (priv.session_save_source != null) return;
+        priv.session_save_source = glib.timeoutAdd(
+            session_save_delay_ms,
+            handleSaveSessionTimeout,
+            self,
+        );
+    }
+
+    /// Timeout callback that performs a scheduled session save exactly once.
+    fn handleSaveSessionTimeout(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse
+            return @intFromBool(glib.SOURCE_REMOVE)));
+        self.private().session_save_source = null;
+        // Event-driven saves (tab/cwd changes) persist structure only; dumping
+        // scrollback here would be too frequent. Scrollback is flushed on
+        // window close and quit instead.
+        self.saveSession(false, null);
+        return @intFromBool(glib.SOURCE_REMOVE);
+    }
+
     /// Setup our action map.
     fn startupActionMap(self: *Self) void {
         const t_variant_type = glib.ext.VariantType.newFor(u64);
@@ -1540,11 +2241,24 @@ pub const Application = extern struct {
     fn activate(self: *Self) callconv(.c) void {
         log.debug("activate", .{});
 
-        // Queue a new window
         const priv = self.private();
-        _ = priv.core_app.mailbox.push(global.io(), .{
-            .new_window = .{},
-        }, .{ .forever = {} });
+
+        // The first activation of the primary instance restores the saved
+        // session in place of the default window. This lives here rather
+        // than in `run` so that D-Bus activation restores too: the D-Bus
+        // service starts the process with `--initial-window=false` and the
+        // desktop shell's Activate call is what asks for the first window.
+        const restored = restored: {
+            if (priv.did_first_activate) break :restored false;
+            priv.did_first_activate = true;
+            break :restored self.tryRestoreSession();
+        };
+
+        if (!restored) {
+            _ = priv.core_app.mailbox.push(global.io(), .{
+                .new_window = .{},
+            }, .{ .forever = {} });
+        }
 
         // Call the parent activate method.
         gio.Application.virtual_methods.activate.call(
@@ -1565,6 +2279,12 @@ pub const Application = extern struct {
                 log.warn("unable to remove signal source", .{});
             }
             priv.signal_source = null;
+        }
+        if (priv.session_save_source) |v| {
+            if (glib.Source.remove(v) == 0) {
+                log.warn("unable to remove session save source", .{});
+            }
+            priv.session_save_source = null;
         }
 
         if (priv.bell_media) |v| {
@@ -2694,6 +3414,14 @@ const Action = struct {
         }
     }
 
+    /// An explicit window geometry override (session restore).
+    pub const WindowGeometry = struct {
+        /// Size in pixels. Both must be set for the size to be applied.
+        width: ?c_int = null,
+        height: ?c_int = null,
+        maximized: bool = false,
+    };
+
     pub fn newWindow(
         self: *Application,
         parent: ?*CoreSurface,
@@ -2706,6 +3434,40 @@ const Action = struct {
             pub const none: @This() = .{};
         },
     ) !void {
+        _ = try newWindowReturning(self, parent, .{
+            .command = overrides.command,
+            .shell_integration = overrides.shell_integration,
+            .working_directory = overrides.working_directory,
+            .title = overrides.title,
+        }, null, null);
+    }
+
+    /// Same as `newWindow` but returns the created window and accepts an
+    /// optional explicit size. Used by session restore so we can add
+    /// additional tabs and restore window geometry.
+    pub fn newWindowReturning(
+        self: *Application,
+        parent: ?*CoreSurface,
+        overrides: struct {
+            command: ?configpkg.Command = null,
+            shell_integration: ?configpkg.Config.ShellIntegration = null,
+            working_directory: ?[:0]const u8 = null,
+            title: ?[:0]const u8 = null,
+            tab_title: ?[:0]const u8 = null,
+            restore_scrollback: ?[]const u8 = null,
+            /// Stable id for the window's first tab (session restore).
+            id: ?u64 = null,
+            /// A pre-built split tree to install in the window's first tab,
+            /// and the surface within it to focus (session restore).
+            tree: ?*const Surface.Tree = null,
+            focus: ?*Surface = null,
+
+            pub const none: @This() = .{};
+        },
+        geometry: ?WindowGeometry,
+        /// Stable id for the window itself (session restore).
+        window_id: ?u64,
+    ) !*Window {
         // Note that we've requested a window at least once. This is used
         // to trigger quit on no windows. Note I'm not sure if this is REALLY
         // necessary, but I don't want to risk a bug where on a slow machine
@@ -2715,6 +3477,7 @@ const Action = struct {
 
         const win = Window.new(self, .{
             .title = overrides.title,
+            .id = window_id,
         });
         initAndShowWindow(
             self,
@@ -2725,8 +3488,15 @@ const Action = struct {
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .tab_title = overrides.tab_title,
+                .restore_scrollback = overrides.restore_scrollback,
+                .id = overrides.id,
+                .tree = overrides.tree,
+                .focus = overrides.focus,
             },
+            geometry,
         );
+        return win;
     }
 
     fn initAndShowWindow(
@@ -2738,9 +3508,15 @@ const Action = struct {
             shell_integration: ?configpkg.Config.ShellIntegration = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            tab_title: ?[:0]const u8 = null,
+            restore_scrollback: ?[]const u8 = null,
+            id: ?u64 = null,
+            tree: ?*const Surface.Tree = null,
+            focus: ?*Surface = null,
 
             pub const none: @This() = .{};
         },
+        geometry: ?WindowGeometry,
     ) void {
         // Setup a binding so that whenever our config changes so does the
         // window. There's never a time when the window config should be out
@@ -2759,18 +3535,33 @@ const Action = struct {
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .tab_title = overrides.tab_title,
+            .restore_scrollback = overrides.restore_scrollback,
+            .id = overrides.id,
+            .tree = overrides.tree,
+            .focus = overrides.focus,
         });
 
         // Estimate the initial window size before presenting so the window
         // manager can position it correctly.
         if (win.getActiveSurface()) |surface| {
             surface.estimateInitialSize();
-            if (surface.getDefaultSize()) |size| {
+            if (surface.getDefaultSize()) |default_size| {
                 win.as(gtk.Window).setDefaultSize(
-                    @intCast(size.width),
-                    @intCast(size.height),
+                    @intCast(default_size.width),
+                    @intCast(default_size.height),
                 );
             }
+        }
+
+        // If an explicit geometry was requested (e.g. session restore), it
+        // overrides the surface estimate. This must happen before present so
+        // the window is mapped at the restored size and state.
+        if (geometry) |g| {
+            if (g.width) |w| if (g.height) |h| {
+                win.as(gtk.Window).setDefaultSize(w, h);
+            };
+            if (g.maximized) win.as(gtk.Window).maximize();
         }
 
         // Show the window
@@ -3191,7 +3982,7 @@ const Action = struct {
             .@"quick-terminal" = true,
         });
         assert(win.isQuickTerminal());
-        initAndShowWindow(self, win, null, .none);
+        initAndShowWindow(self, win, null, .none, null);
         return true;
     }
 

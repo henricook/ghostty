@@ -154,6 +154,14 @@ pub const SplitTree = extern struct {
         /// tree change states.
         last_focused: WeakRef(Surface) = .empty,
 
+        /// The surface that must receive focus for a restored tree
+        /// (session restore). This exists separately from `last_focused`
+        /// because the window's initial keyboard focus lands on the first
+        /// surface widget when it is presented, which overwrites
+        /// `last_focused` before `onRestoreFocus` runs. Cleared once
+        /// focus has been delivered.
+        restore_focus_target: WeakRef(Surface) = .empty,
+
         /// The source that we use to rebuild the tree. This is also
         /// used to debounce updates.
         rebuild_source: ?c_uint = null,
@@ -217,6 +225,7 @@ pub const SplitTree = extern struct {
             shell_integration: ?configpkg.Config.ShellIntegration = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            restore_scrollback: ?[]const u8 = null,
 
             pub const none: @This() = .{};
         },
@@ -229,6 +238,7 @@ pub const SplitTree = extern struct {
             .shell_integration = overrides.shell_integration,
             .working_directory = overrides.working_directory,
             .title = overrides.title,
+            .restore_scrollback = overrides.restore_scrollback,
         });
         defer surface.unref();
         _ = surface.refSink();
@@ -280,6 +290,34 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+    }
+
+    /// Install a fully-formed tree, e.g. one rebuilt from a saved session.
+    ///
+    /// The tree is cloned (see `setTree`) so the caller keeps ownership of
+    /// both the tree and its surfaces. `focus_` is the surface that should
+    /// be focused once the widget hierarchy is rebuilt; it must be a member
+    /// of the given tree.
+    pub fn setRestoredTree(
+        self: *Self,
+        tree: *const Surface.Tree,
+        focus_: ?*Surface,
+    ) void {
+        self.setTree(tree);
+
+        var it = tree.iterator();
+        while (it.next()) |entry| entry.view.bindIsSplit(self);
+
+        // The rebuild happens on an idle callback and grabs focus once the
+        // target surface is mapped. `last_focused` alone is not enough: the
+        // window's initial focus lands on the first surface widget at
+        // present time and would overwrite it, so the target is also pinned
+        // in `restore_focus_target`.
+        if (focus_) |v| {
+            const priv = self.private();
+            priv.last_focused.set(v);
+            priv.restore_focus_target.set(v);
+        }
     }
 
     pub fn resize(
@@ -648,6 +686,7 @@ pub const SplitTree = extern struct {
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.last_focused.deinit();
+        priv.restore_focus_target.deinit();
         if (priv.rebuild_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove rebuild source", .{});
@@ -961,6 +1000,21 @@ pub const SplitTree = extern struct {
         // Always mark our source as null since we're done.
         const priv = self.private();
         priv.restore_focus_source = null;
+
+        // A pending restore-focus target (session restore) wins over
+        // last_focused, which the window's initial focus may have already
+        // clobbered. If the target isn't mapped yet (e.g. its allocation is
+        // still zero), keep it pending: a later map schedules this idle
+        // again. The weak ref clears itself if the surface is destroyed.
+        if (priv.restore_focus_target.get()) |v| {
+            defer v.unref();
+            if (v.getMapped()) {
+                v.grabFocus();
+                priv.last_focused.set(v);
+                priv.restore_focus_target.set(null);
+            }
+            return 0;
+        }
 
         // If we have a last-focused surface and it is mapped, restore focus
         // to it. Depending on the available size, the surface might already
@@ -1335,6 +1389,10 @@ const SplitTreeSplit = extern struct {
                 assert(tree.nodes[priv.handle.idx()] == .split);
                 tree.resizeInPlace(priv.handle, @floatCast(current_ratio));
                 priv.ratio = current_ratio;
+
+                // The tree is mutated in place here so no property notify
+                // fires; schedule the session save ourselves.
+                Application.default().scheduleSaveSession();
             },
         }
     }

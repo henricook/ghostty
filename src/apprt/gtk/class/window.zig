@@ -11,6 +11,7 @@ const gtk = @import("gtk");
 const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
 const configpkg = @import("../../../config.zig");
+const global = @import("../../../global.zig");
 const TitlebarStyle = configpkg.Config.GtkTitlebarStyle;
 const input = @import("../../../input.zig");
 const CoreSurface = @import("../../../Surface.zig");
@@ -18,6 +19,7 @@ const ext = @import("../ext.zig");
 const gtk_version = @import("../gtk_version.zig");
 const adw_version = @import("../adw_version.zig");
 const gresource = @import("../build/gresource.zig");
+const session = @import("../session.zig");
 const winprotopkg = @import("../winproto.zig");
 const Common = @import("../class.zig").Common;
 const Config = @import("config.zig").Config;
@@ -230,6 +232,10 @@ pub const Window = extern struct {
     };
 
     const Private = struct {
+        /// Stable random identifier for this window, assigned at creation and
+        /// overridable on session restore.
+        id: u64 = 0,
+
         /// Whether this window is a quick terminal. If it is then it
         /// behaves slightly differently under certain scenarios.
         quick_terminal: bool = false,
@@ -290,6 +296,9 @@ pub const Window = extern struct {
         app: *Application,
         overrides: struct {
             title: ?[:0]const u8 = null,
+            /// Stable id to assign (from session restore). If null, a fresh
+            /// random id is generated.
+            id: ?u64 = null,
 
             pub const none: @This() = .{};
         },
@@ -297,6 +306,10 @@ pub const Window = extern struct {
         const win = gobject.ext.newInstance(Self, .{
             .application = app,
         });
+
+        // `init` already assigned a fresh random id; override it with the
+        // restored id when one is provided.
+        if (overrides.id) |id| win.private().id = id;
 
         if (overrides.title) |title| {
             // If the overrides have a title set, we set that immediately
@@ -315,6 +328,10 @@ pub const Window = extern struct {
         // If our configuration is null then we get the configuration
         // from the application.
         const priv = self.private();
+
+        // Assign a stable random id to every window at creation. `new()` may
+        // override it (with a restored id) for session restore.
+        priv.id = session.newId(global.io());
 
         const config = config: {
             if (priv.config) |config| break :config config.get();
@@ -366,6 +383,25 @@ pub const Window = extern struct {
         // We need to do this so that the title initializes properly,
         // I think because its a dynamic getter.
         self.as(gobject.Object).notifyByPspec(properties.@"active-surface".impl.param_spec);
+
+        // Tab order and window geometry are both persisted but have no
+        // dedicated blueprint callback, so watch them here.
+        _ = adw.TabView.signals.page_reordered.connect(
+            priv.tab_view,
+            *Self,
+            tabViewPageReordered,
+            self,
+            .{},
+        );
+        for ([_][:0]const u8{ "default-width", "default-height" }) |detail| {
+            _ = gobject.Object.signals.notify.connect(
+                self,
+                *Self,
+                propDefaultSize,
+                self,
+                .{ .detail = detail },
+            );
+        }
     }
 
     /// Setup our action map.
@@ -432,6 +468,13 @@ pub const Window = extern struct {
             shell_integration: ?configpkg.Config.ShellIntegration = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            tab_title: ?[:0]const u8 = null,
+            restore_scrollback: ?[]const u8 = null,
+            id: ?u64 = null,
+            /// A pre-built split tree to install in the new tab, and the
+            /// surface within it to focus (session restore). See `Tab.new`.
+            tree: ?*const Surface.Tree = null,
+            focus: ?*Surface = null,
 
             pub const none: @This() = .{};
         },
@@ -444,6 +487,11 @@ pub const Window = extern struct {
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .tab_title = overrides.tab_title,
+                .restore_scrollback = overrides.restore_scrollback,
+                .id = overrides.id,
+                .tree = overrides.tree,
+                .focus = overrides.focus,
             },
         );
     }
@@ -457,6 +505,13 @@ pub const Window = extern struct {
             shell_integration: ?configpkg.Config.ShellIntegration = null,
             working_directory: ?[:0]const u8 = null,
             title: ?[:0]const u8 = null,
+            tab_title: ?[:0]const u8 = null,
+            restore_scrollback: ?[]const u8 = null,
+            id: ?u64 = null,
+            /// A pre-built split tree to install in the new tab, and the
+            /// surface within it to focus (session restore). See `Tab.new`.
+            tree: ?*const Surface.Tree = null,
+            focus: ?*Surface = null,
 
             pub const none: @This() = .{};
         },
@@ -472,6 +527,11 @@ pub const Window = extern struct {
                 .shell_integration = overrides.shell_integration,
                 .working_directory = overrides.working_directory,
                 .title = overrides.title,
+                .tab_title = overrides.tab_title,
+                .restore_scrollback = overrides.restore_scrollback,
+                .id = overrides.id,
+                .tree = overrides.tree,
+                .focus = overrides.focus,
             },
         );
 
@@ -526,6 +586,19 @@ pub const Window = extern struct {
             tabSplitTreeChanged,
             self,
             .{},
+        );
+
+        // The "changed" signal above only fires when the tree is replaced.
+        // We watch the property too because zoom toggles mutate the existing
+        // tree in place and only notify, and both affect saved state. This one
+        // takes no user data: it only pokes the application, and it must keep
+        // working after the tab is dragged into a different window.
+        _ = gobject.Object.signals.notify.connect(
+            split_tree,
+            ?*anyopaque,
+            tabSplitTreeNotify,
+            null,
+            .{ .detail = "tree" },
         );
 
         // Run an initial notification for the surface tree so we can setup
@@ -962,6 +1035,11 @@ pub const Window = extern struct {
         return tab.getActiveSurface();
     }
 
+    /// The stable id of this window. See `Private.id`.
+    pub fn getId(self: *Self) u64 {
+        return self.private().id;
+    }
+
     /// Returns the configuration for this window. The reference count
     /// is not increased.
     pub fn getConfig(self: *Self) ?*Config {
@@ -1259,6 +1337,28 @@ pub const Window = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.syncAppearance();
+
+        // The maximized state is persisted, so the session changed.
+        Application.default().scheduleSaveSession();
+    }
+
+    fn propDefaultSize(
+        _: *Self,
+        _: *gobject.ParamSpec,
+        _: *Self,
+    ) callconv(.c) void {
+        // Window geometry is persisted, so the session changed.
+        Application.default().scheduleSaveSession();
+    }
+
+    fn tabViewPageReordered(
+        _: *adw.TabView,
+        _: *adw.TabPage,
+        _: c_int,
+        _: *Self,
+    ) callconv(.c) void {
+        // Tab order is persisted, so the session changed.
+        Application.default().scheduleSaveSession();
     }
 
     fn propMenuActive(
@@ -1334,6 +1434,16 @@ pub const Window = extern struct {
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
 
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
+
+        // Title overrides are persisted, so the session changed.
+        Application.default().scheduleSaveSession();
+    }
+
+    /// Returns the user-set window title override, if any. Unlike the "title"
+    /// property this does not fall back to the surface/terminal title, so only
+    /// titles the user explicitly chose are persisted.
+    pub fn getTitleOverride(self: *Self) ?[:0]const u8 {
+        return self.private().title_override;
     }
 
     fn titleDialogSet(_: *TitleDialog, title_: [*:0]const u8, self: *Self) callconv(.c) void {
@@ -1590,6 +1700,7 @@ pub const Window = extern struct {
             return @intFromBool(true);
         }
 
+        self.saveSessionOnClose();
         self.as(gtk.Window).destroy();
         return @intFromBool(false);
     }
@@ -1598,7 +1709,18 @@ pub const Window = extern struct {
         _: *CloseConfirmationDialog,
         self: *Self,
     ) callconv(.c) void {
+        self.saveSessionOnClose();
         self.as(gtk.Window).destroy();
+    }
+
+    /// Persist the session as it will be once this window is gone. When the
+    /// user closes the last window GTK destroys it before the run loop notices
+    /// there are no windows left and calls quitNow, so saving only at quit
+    /// time would miss it; and this window is still a live toplevel here, so
+    /// it has to be excluded explicitly rather than corrected by a later save.
+    fn saveSessionOnClose(self: *Self) void {
+        log.debug("window closing, saving session", .{});
+        Application.default().saveSession(true, self);
     }
 
     fn closeConfirmationCloseTab(
@@ -1690,6 +1812,9 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        // The selected tab is persisted, so the session changed.
+        Application.default().scheduleSaveSession();
     }
 
     fn tabViewPageAttached(
@@ -1733,6 +1858,9 @@ pub const Window = extern struct {
         if (tab.getSurfaceTree()) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+
+        // A tab (or a new window's first tab) was added: persist the session.
+        Application.default().scheduleSaveSession();
     }
 
     fn tabViewPageDetached(
@@ -1754,10 +1882,27 @@ pub const Window = extern struct {
             self,
         );
 
+        // Remove the SplitTree handlers that carry this window as user data:
+        // a tab dragged into another window would otherwise keep calling us
+        // after we're gone.
+        _ = gobject.signalHandlersDisconnectMatched(
+            tab.getSplitTree().as(gobject.Object),
+            .{ .data = true },
+            0,
+            0,
+            null,
+            null,
+            self,
+        );
+
         // Remove the tree handlers
         if (tab.getSurfaceTree()) |tree| {
             self.disconnectSurfaceHandlers(tree);
         }
+
+        // A tab was removed: persist the session. This is scheduled to idle so
+        // it runs after the teardown completes and the window list is stable.
+        Application.default().scheduleSaveSession();
     }
 
     fn tabViewCreateWindow(
@@ -1958,6 +2103,15 @@ pub const Window = extern struct {
         if (new_tree) |tree| {
             self.connectSurfaceHandlers(tree);
         }
+    }
+
+    fn tabSplitTreeNotify(
+        _: *SplitTree,
+        _: *gobject.ParamSpec,
+        _: ?*anyopaque,
+    ) callconv(.c) void {
+        // The split layout (or its zoom state) changed: persist the session.
+        Application.default().scheduleSaveSession();
     }
 
     fn actionAbout(
